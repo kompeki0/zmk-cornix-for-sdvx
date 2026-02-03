@@ -51,15 +51,16 @@ enum hold_dir {
 };
 
 struct hold_state {
+    bool inited;
     bool active;
     struct zmk_behavior_binding active_binding;
 
-    // timeout release 用に最後の event 情報を保存
     int16_t last_position;
     uint8_t last_layer;
 
     struct k_work_delayable release_work;
 };
+
 
 struct behavior_sensor_hold_rotate_data {
     // accept_data で方向を貯めておく（processで消費）
@@ -85,7 +86,7 @@ static void arm_timeout(const struct behavior_sensor_hold_rotate_config *cfg,
                         struct hold_state *st) {
     uint16_t ms = cfg->timeout_ms ? cfg->timeout_ms : 180;
     if (ms < 1) ms = 1;
-    k_work_schedule(&st->release_work, K_MSEC(ms));
+    k_work_reschedule(&st->release_work, K_MSEC(ms));
 }
 
 static void release_work_handler(struct k_work *work) {
@@ -172,7 +173,10 @@ static int process(struct zmk_behavior_binding *binding,
     struct hold_state *st = &data->state[sensor_index][event.layer];
 
     // 初回だけ init（毎回でも害はない）
-    k_work_init_delayable(&st->release_work, release_work_handler);
+    if (!st->inited) {
+        k_work_init_delayable(&st->release_work, release_work_handler);
+        st->inited = true;
+    }
 
     // timeout release 用の情報を更新
     st->last_position = event.position;
