@@ -3,10 +3,16 @@ description: Sensor hold rotate behavior
 compatible: "zmk,behavior-sensor-hold-rotate"
 
 properties:
+  "#sensor-binding-cells":
+    type: int
+    required: true
+    const: 0
+    description: "Number of argument cells for sensor-bindings."
+
   bindings:
     type: phandle-array
     required: true
-    description: "Two bindings: CW then CCW (each can have params, e.g. &kp C_VOL_UP)."
+    description: "Two bindings: CW then CCW (each can have params)."
 
   timeout-ms:
     type: int
