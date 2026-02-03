@@ -1,4 +1,4 @@
-name: zmk-behaviour-cornix-for-sdvx
+name: zmk-behaviour-refcount-key
 build:
   cmake: .
   kconfig: Kconfig
