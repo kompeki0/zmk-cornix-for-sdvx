@@ -2,14 +2,11 @@ description: Sensor hold rotate behavior (treat encoder steps as a hold)
 
 compatible: "zmk,behavior-sensor-hold-rotate"
 
-include: sensor_behavior.yaml
-
 properties:
   bindings:
     type: phandles
     required: true
-    description: >
-      Two bindings: CW binding then CCW binding.
+    description: Two bindings: CW binding then CCW binding.
 
   timeout-ms:
     type: int
