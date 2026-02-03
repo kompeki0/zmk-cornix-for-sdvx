@@ -13,6 +13,7 @@
 #include <zmk/behavior.h>
 #include <zmk/behavior_queue.h>
 #include <zmk/virtual_key_position.h>
+#include <zmk/events/position_state_changed.h>
 
 #ifndef ZMK_KEYMAP_SENSORS_LEN
 #define ZMK_KEYMAP_SENSORS_LEN 0
