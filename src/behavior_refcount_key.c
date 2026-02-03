@@ -1,120 +1,119 @@
-#include <zephyr/kernel.h>
-#include <zephyr/device.h>
-#include <zephyr/devicetree.h>
-#include <zephyr/logging/log.h>
-
-#include <drivers/behavior.h>
-#include <zmk/hid.h>
-
-LOG_MODULE_REGISTER(behavior_refcount_key, CONFIG_ZMK_LOG_LEVEL);
-
 /*
- * Devicetree binding の compatible に対応させる。
- * 例: compatible = "zmk,behavior-refcount-key";
- * → DT_DRV_COMPAT は zmk_behavior_refcount_key
+ * SPDX-License-Identifier: MIT
  */
+
 #define DT_DRV_COMPAT zmk_behavior_refcount_key
 
+#include <zephyr/device.h>
+#include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/sys/atomic.h>
+
+#include <drivers/behavior.h>
+
+#include <zmk/behavior.h>
+#include <zmk/endpoints.h>
+#include <zmk/hid.h>
+
+LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
+
 /*
- * “まず通常キーコードのみ” 前提で、
- * keycode を 0..255 の範囲として参照カウントする。
+ * シンプル版：Keyboard(Usage Page 0x07)の keycode(0-255) だけを refcount。
+ * 参照カウントが 0→1 になったときに press を送信し、1→0 になったときに release を送信。
  *
- * ※必要なら 512 などに拡張可能（ただしRAM増える）
+ * 「同じ keycode を送るのは全部 &refcount_key 経由」なら、これで狙い通り動きます。
  */
-#ifndef REFCNT_KEY_MAX
-#define REFCNT_KEY_MAX 256
-#endif
 
-struct behavior_refcount_key_data {
-    uint8_t cnt[REFCNT_KEY_MAX];
-};
+#define KEYCODE_MAX 256
 
-static int behavior_refcount_key_press(const struct device *dev,
-                                       struct zmk_behavior_binding *binding,
-                                       struct zmk_behavior_binding_event event) {
-    ARG_UNUSED(event);
+/* keycodeごとの押下参照カウント */
+static atomic_t refcnt[KEYCODE_MAX];
 
-    struct behavior_refcount_key_data *data = dev->data;
-    const uint32_t keycode = binding->param1;
+static inline int send_press(uint8_t keycode) {
+    /* ZMKのHID状態へ反映 */
+    zmk_hid_keyboard_press(keycode);
 
-    if (keycode >= REFCNT_KEY_MAX) {
-        LOG_WRN("keycode %u out of range (max %d)", (unsigned)keycode, REFCNT_KEY_MAX - 1);
-        return 0;
-    }
-
-    if (data->cnt[keycode] < 0xFF) {
-        data->cnt[keycode]++;
-    } else {
-        /* 異常系：押しっぱなし/バグでオーバーフローしないように */
-        LOG_WRN("refcount overflow for keycode %u", (unsigned)keycode);
-    }
-
-    /*
-     * 0→1 になった瞬間だけ “press” を送る
-     */
-    if (data->cnt[keycode] == 1) {
-        zmk_hid_keyboard_press(keycode);
-        return zmk_endpoints_send_report(ZMK_HID_USAGE_KEYBOARD);
-    }
-
-    return 0;
+    /* ホストへ送信 */
+    return zmk_endpoints_send_report();
 }
 
-static int behavior_refcount_key_release(const struct device *dev,
-                                         struct zmk_behavior_binding *binding,
-                                         struct zmk_behavior_binding_event event) {
-    ARG_UNUSED(event);
+static inline int send_release(uint8_t keycode) {
+    zmk_hid_keyboard_release(keycode);
+    return zmk_endpoints_send_report();
+}
 
-    struct behavior_refcount_key_data *data = dev->data;
-    const uint32_t keycode = binding->param1;
+static int on_refcount_key_pressed(struct zmk_behavior_binding *binding,
+                                   struct zmk_behavior_binding_event event) {
+    /* param1 を keycode として扱う（&refcount_key <KC> の <KC>） */
+    uint8_t keycode = (uint8_t)binding->param1;
 
-    if (keycode >= REFCNT_KEY_MAX) {
-        return 0;
+    if (keycode >= KEYCODE_MAX) {
+        LOG_ERR("refcount_key: invalid keycode %d", keycode);
+        return ZMK_BEHAVIOR_OPAQUE;
     }
 
-    /*
-     * 参照が残ってる間は release を送らない。
-     * 最後の1個が離されたタイミング（1→0）だけ “release” を送る。
-     */
-    if (data->cnt[keycode] == 0) {
-        /* 二重release等の異常系は無視 */
-        return 0;
+    /* refcount++ して、0→1 のときだけ press を実際に送る */
+    int prev = atomic_inc(&refcnt[keycode]);
+    if (prev == 0) {
+        LOG_DBG("refcount_key: press kc=%d (cnt 0->1)", keycode);
+        (void)send_press(keycode);
+    } else {
+        LOG_DBG("refcount_key: press kc=%d (cnt %d->%d)", keycode, prev, prev + 1);
     }
 
-    data->cnt[keycode]--;
+    /* ここは “透過” にせず OPAQUE 推奨（同一位置で他の処理をさせない） */
+    return ZMK_BEHAVIOR_OPAQUE;
+}
 
-    if (data->cnt[keycode] == 0) {
-        zmk_hid_keyboard_release(keycode);
-        return zmk_endpoints_send_report(ZMK_HID_USAGE_KEYBOARD);
+static int on_refcount_key_released(struct zmk_behavior_binding *binding,
+                                    struct zmk_behavior_binding_event event) {
+    uint8_t keycode = (uint8_t)binding->param1;
+
+    if (keycode >= KEYCODE_MAX) {
+        LOG_ERR("refcount_key: invalid keycode %d", keycode);
+        return ZMK_BEHAVIOR_OPAQUE;
     }
 
-    return 0;
+    int prev = atomic_get(&refcnt[keycode]);
+    if (prev <= 0) {
+        /* release が多重に来た、または別経路で崩れた */
+        LOG_WRN("refcount_key: underflow kc=%d (cnt=%d)", keycode, prev);
+        atomic_set(&refcnt[keycode], 0);
+        return ZMK_BEHAVIOR_OPAQUE;
+    }
+
+    /* refcount-- して、1→0 のときだけ release を実際に送る */
+    prev = atomic_dec(&refcnt[keycode]);
+    int now = prev - 1;
+
+    if (now == 0) {
+        LOG_DBG("refcount_key: release kc=%d (cnt 1->0)", keycode);
+        (void)send_release(keycode);
+    } else {
+        LOG_DBG("refcount_key: release kc=%d (cnt %d->%d)", keycode, prev, now);
+    }
+
+    return ZMK_BEHAVIOR_OPAQUE;
 }
 
 static const struct behavior_driver_api behavior_refcount_key_driver_api = {
-    .binding_pressed = behavior_refcount_key_press,
-    .binding_released = behavior_refcount_key_release,
+    .binding_pressed = on_refcount_key_pressed,
+    .binding_released = on_refcount_key_released,
 };
 
+static int behavior_refcount_key_init(const struct device *dev) {
+    ARG_UNUSED(dev);
+    return 0;
+}
+
 /*
- * ★重要：この compatible のノードが Devicetree 上に1つも無い時
- *        (settings_reset のビルドなど) は、デバイス定義しない。
+ * ここが leader_key と同じ “DTインスタンス生成” の作法。
+ * DTに node が存在する分だけ behavior デバイスが生成される。
  *
- * これで “DT_N_INST_0_... が無い” 系のエラーを回避できる。
+ * ※ このbehaviorは config を持たない（param1で動く）ので config=NULL でOK。
  */
-#if DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT)
+#define REFCOUNT_INST(n)                                                                          \
+    BEHAVIOR_DT_INST_DEFINE(n, behavior_refcount_key_init, NULL, NULL, NULL, POST_KERNEL,         \
+                            CONFIG_KERNEL_INIT_PRIORITY_DEFAULT, &behavior_refcount_key_driver_api);
 
-#define REFCNT_INST_DEFINE(inst)                                                            \
-    static struct behavior_refcount_key_data behavior_refcount_key_data_##inst = {0};       \
-    BEHAVIOR_DT_INST_DEFINE(inst,                                                           \
-                            NULL, /* init */                                                \
-                            NULL, /* pm */                                                  \
-                            &behavior_refcount_key_data_##inst,                             \
-                            NULL, /* config */                                              \
-                            POST_KERNEL,                                                    \
-                            CONFIG_KERNEL_INIT_PRIORITY_DEFAULT,                            \
-                            &behavior_refcount_key_driver_api);
-
-DT_INST_FOREACH_STATUS_OKAY(REFCNT_INST_DEFINE)
-
-#endif /* DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT) */
+DT_INST_FOREACH_STATUS_OKAY(REFCOUNT_INST)
