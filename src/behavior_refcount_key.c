@@ -2,7 +2,6 @@
 
 #include <zephyr/device.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/drivers/behavior.h>
 #include <zmk/behavior.h>
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
