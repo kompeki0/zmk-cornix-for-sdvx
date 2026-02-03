@@ -1,7 +1,5 @@
-if(CONFIG_ZMK_BEHAVIOR_REFCOUNT_KEY)
-  zephyr_library()
+# CMakeLists.txt (module root)
+if ((NOT CONFIG_ZMK_SPLIT) OR CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+  target_sources(app PRIVATE src/behavior_refcount_key.c)
   zephyr_include_directories(include)
-  zephyr_library_sources(
-    src/behavior_refcount_key.c
-  )
 endif()
