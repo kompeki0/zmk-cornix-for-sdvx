@@ -11,53 +11,82 @@
 #include <drivers/behavior.h>
 
 #include <zmk/behavior.h>
-#include <zmk/endpoints.h>
-#include <zmk/hid.h>
+#include <zmk/event_manager.h>
+#include <zmk/events/keycode_state_changed.h>
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 /*
- * 「通常キーコードのみ」前提：
- * - HID Usage Page = Keyboard/Keypad (0x07)
- * - keycode は 0..255 を想定
- *
- * param1 にキーコードが入ってくる想定（&refcount_key A みたいに使う）
+ * encoded HID usage (binding->param1) ごとに refcount を持つ
+ * - 256キー全部を配列で持つのは encoded の形式が広いのでやめる
+ * - 使うキー数は多くてもせいぜい数十のはずなので固定テーブルでOK
  */
-static uint8_t refcounts[256];
+#ifndef CONFIG_ZMK_REFCOUNT_KEY_MAX_TRACKED
+#define CONFIG_ZMK_REFCOUNT_KEY_MAX_TRACKED 32
+#endif
 
-static int send_press(uint8_t keycode) {
-    zmk_hid_keyboard_press(keycode);
-    return zmk_endpoints_send_report(zmk_hid_get_keyboard_report());
+struct ref_item {
+    uint32_t encoded;
+    uint8_t count;
+};
+
+static struct ref_item refs[CONFIG_ZMK_REFCOUNT_KEY_MAX_TRACKED];
+
+static struct ref_item *get_or_alloc(uint32_t encoded) {
+    struct ref_item *free_slot = NULL;
+
+    for (int i = 0; i < CONFIG_ZMK_REFCOUNT_KEY_MAX_TRACKED; i++) {
+        if (refs[i].encoded == encoded && refs[i].count > 0) {
+            return &refs[i];
+        }
+        if (refs[i].count == 0 && free_slot == NULL) {
+            free_slot = &refs[i];
+        }
+    }
+
+    if (free_slot) {
+        free_slot->encoded = encoded;
+        free_slot->count = 0;
+        return free_slot;
+    }
+
+    return NULL; // テーブル不足
 }
 
-static int send_release(uint8_t keycode) {
-    zmk_hid_keyboard_release(keycode);
-    return zmk_endpoints_send_report(zmk_hid_get_keyboard_report());
+static struct ref_item *find_existing(uint32_t encoded) {
+    for (int i = 0; i < CONFIG_ZMK_REFCOUNT_KEY_MAX_TRACKED; i++) {
+        if (refs[i].encoded == encoded && refs[i].count > 0) {
+            return &refs[i];
+        }
+    }
+    return NULL;
+}
+
+static int emit_keycode_event(uint32_t encoded, bool pressed, int64_t timestamp) {
+    // kp と同じ “ZMKの正規ルート”
+    return raise_zmk_keycode_state_changed_from_encoded(encoded, pressed, timestamp);
 }
 
 static int on_keymap_binding_pressed(struct zmk_behavior_binding *binding,
                                      struct zmk_behavior_binding_event event) {
-    ARG_UNUSED(event);
+    const uint32_t encoded = binding->param1;
 
-    const uint32_t keycode_u32 = binding->param1;
-    if (keycode_u32 > 255) {
-        LOG_ERR("refcount_key: keycode out of range: %u", keycode_u32);
+    struct ref_item *it = get_or_alloc(encoded);
+    if (!it) {
+        LOG_ERR("refcount_key: table full (increase CONFIG_ZMK_REFCOUNT_KEY_MAX_TRACKED)");
         return ZMK_BEHAVIOR_OPAQUE;
     }
 
-    const uint8_t keycode = (uint8_t)keycode_u32;
-
-    /* 0 -> 1 のときだけ実際に press を送る */
-    if (refcounts[keycode] == 0) {
-        refcounts[keycode] = 1;
-        LOG_DBG("refcount_key press kc=%u rc=1", keycode);
-        (void)send_press(keycode);
+    if (it->count == 0) {
+        it->count = 1;
+        LOG_DBG("refcount_key press encoded=0x%08X rc=1 pos=%d", encoded, event.position);
+        (void)emit_keycode_event(encoded, true, event.timestamp);
     } else {
-        /* 飽和対策（255超えは止める） */
-        if (refcounts[keycode] < 255) {
-            refcounts[keycode]++;
+        if (it->count < 255) {
+            it->count++;
         }
-        LOG_DBG("refcount_key press kc=%u rc=%u", keycode, refcounts[keycode]);
+        LOG_DBG("refcount_key press encoded=0x%08X rc=%u pos=%d", encoded, it->count,
+                event.position);
     }
 
     return ZMK_BEHAVIOR_OPAQUE;
@@ -65,29 +94,26 @@ static int on_keymap_binding_pressed(struct zmk_behavior_binding *binding,
 
 static int on_keymap_binding_released(struct zmk_behavior_binding *binding,
                                       struct zmk_behavior_binding_event event) {
-    ARG_UNUSED(event);
+    const uint32_t encoded = binding->param1;
 
-    const uint32_t keycode_u32 = binding->param1;
-    if (keycode_u32 > 255) {
+    struct ref_item *it = find_existing(encoded);
+    if (!it) {
+        LOG_WRN("refcount_key release while not tracked encoded=0x%08X pos=%d", encoded,
+                event.position);
         return ZMK_BEHAVIOR_OPAQUE;
     }
 
-    const uint8_t keycode = (uint8_t)keycode_u32;
-
-    if (refcounts[keycode] == 0) {
-        /* release の順序が壊れても暴れないように握りつぶす */
-        LOG_WRN("refcount_key release while rc=0 kc=%u", keycode);
-        return ZMK_BEHAVIOR_OPAQUE;
+    if (it->count > 0) {
+        it->count--;
     }
 
-    refcounts[keycode]--;
-
-    /* 1 -> 0 のときだけ実際に release を送る */
-    if (refcounts[keycode] == 0) {
-        LOG_DBG("refcount_key release kc=%u rc=0 (send)", keycode);
-        (void)send_release(keycode);
+    if (it->count == 0) {
+        LOG_DBG("refcount_key release encoded=0x%08X rc=0 (emit) pos=%d", encoded, event.position);
+        (void)emit_keycode_event(encoded, false, event.timestamp);
+        // slot は count==0 になったので再利用可能
     } else {
-        LOG_DBG("refcount_key release kc=%u rc=%u", keycode, refcounts[keycode]);
+        LOG_DBG("refcount_key release encoded=0x%08X rc=%u pos=%d", encoded, it->count,
+                event.position);
     }
 
     return ZMK_BEHAVIOR_OPAQUE;
@@ -100,12 +126,15 @@ static const struct behavior_driver_api behavior_refcount_key_driver_api = {
 
 static int behavior_refcount_key_init(const struct device *dev) {
     ARG_UNUSED(dev);
+    // refs をゼロクリア（BSSなら本来不要だけど明示してもOK）
+    for (int i = 0; i < CONFIG_ZMK_REFCOUNT_KEY_MAX_TRACKED; i++) {
+        refs[i] = (struct ref_item){0};
+    }
     return 0;
 }
 
-/* leader_key と同じ “型” の登録スタイルに合わせる */
-#define REFCOUNT_INST(n)                                                                            \
-    BEHAVIOR_DT_INST_DEFINE(n, behavior_refcount_key_init, NULL, NULL, NULL, POST_KERNEL,           \
+#define REFCOUNT_INST(n)                                                                           \
+    BEHAVIOR_DT_INST_DEFINE(n, behavior_refcount_key_init, NULL, NULL, NULL, POST_KERNEL,          \
                             CONFIG_KERNEL_INIT_PRIORITY_DEFAULT, &behavior_refcount_key_driver_api);
 
 DT_INST_FOREACH_STATUS_OKAY(REFCOUNT_INST)
