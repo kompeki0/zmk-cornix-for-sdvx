@@ -1,3 +1,6 @@
-menuconfig ZMK_BEHAVIOR_REFCOUNT_KEY
+config ZMK_BEHAVIOR_REFCOUNT_KEY
     bool "Refcount Key behavior"
     default y
+    help
+      Wraps a key press so that multiple physical keys sharing the same keycode
+      keep the key held until the last one is released.
