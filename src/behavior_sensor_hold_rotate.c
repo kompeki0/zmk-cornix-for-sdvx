@@ -15,7 +15,7 @@
 #include <zmk/behavior_queue.h>
 #include <zmk/virtual_key_position.h>
 
-#include "behavior_sensor_rotate_common.h"
+#include <zmk/behavior_sensor_rotate_common.h>
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
