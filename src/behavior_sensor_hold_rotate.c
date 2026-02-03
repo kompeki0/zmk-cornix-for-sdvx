@@ -14,6 +14,15 @@
 #include <zmk/behavior_queue.h>
 #include <zmk/virtual_key_position.h>
 
+#ifndef ZMK_KEYMAP_SENSORS_LEN
+#define ZMK_KEYMAP_SENSORS_LEN 0
+#endif
+
+#ifndef ZMK_KEYMAP_LAYERS_LEN
+#define ZMK_KEYMAP_LAYERS_LEN 1
+#endif
+
+
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 /*
@@ -53,9 +62,8 @@ struct hold_state {
 
 struct behavior_sensor_hold_rotate_data {
     // accept_data で方向を貯めておく（processで消費）
-    enum hold_dir pending_dir[ZMK_KEYMAP_SENSORS_MAX][ZMK_KEYMAP_LAYERS_LEN];
-
-    struct hold_state state[ZMK_KEYMAP_SENSORS_MAX][ZMK_KEYMAP_LAYERS_LEN];
+    enum hold_dir pending_dir[ZMK_KEYMAP_SENSORS_LEN][ZMK_KEYMAP_LAYERS_LEN];
+    struct hold_state state[ZMK_KEYMAP_SENSORS_LEN][ZMK_KEYMAP_LAYERS_LEN];
 };
 
 static int enqueue_press(struct zmk_behavior_binding_event *event,
