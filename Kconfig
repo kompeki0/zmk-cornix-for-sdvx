@@ -1,0 +1,3 @@
+menuconfig ZMK_BEHAVIOR_REFCOUNT_KEY
+    bool "Refcount Key behavior"
+    default y
