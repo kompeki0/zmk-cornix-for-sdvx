@@ -42,18 +42,19 @@ static int behavior_refcount_key_press(const struct device *dev,
         return 0;
     }
 
-    /*
-     * 0→1 になった瞬間だけ “press” を送る
-     */
-    if (data->cnt[keycode] == 0) {
-        zmk_hid_keyboard_press(keycode);
-    }
-
     if (data->cnt[keycode] < 0xFF) {
         data->cnt[keycode]++;
     } else {
         /* 異常系：押しっぱなし/バグでオーバーフローしないように */
         LOG_WRN("refcount overflow for keycode %u", (unsigned)keycode);
+    }
+
+    /*
+     * 0→1 になった瞬間だけ “press” を送る
+     */
+    if (data->cnt[keycode] == 1) {
+        zmk_hid_keyboard_press(keycode);
+        return zmk_endpoints_send_report(ZMK_HID_USAGE_KEYBOARD);
     }
 
     return 0;
@@ -84,6 +85,7 @@ static int behavior_refcount_key_release(const struct device *dev,
 
     if (data->cnt[keycode] == 0) {
         zmk_hid_keyboard_release(keycode);
+        return zmk_endpoints_send_report(ZMK_HID_USAGE_KEYBOARD);
     }
 
     return 0;
