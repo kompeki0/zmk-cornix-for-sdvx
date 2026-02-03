@@ -4,3 +4,13 @@ config ZMK_BEHAVIOR_REFCOUNT_KEY
     help
       Wraps a key press so that multiple physical keys sharing the same keycode
       keep the key held until the last one is released.
+
+menuconfig ZMK_BEHAVIOR_SENSOR_HOLD_ROTATE
+    bool "Sensor hold rotate behavior"
+    default y
+    help
+      Hold-style rotate behavior:
+      - first step sends press
+      - same direction steps only extend timeout
+      - reverse direction releases previous and presses new
+      - timeout releases
