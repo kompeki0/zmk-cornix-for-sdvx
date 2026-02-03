@@ -1,4 +1,4 @@
-name: zmk-cornix-for-sdvx
+name: zmk-behaviour-cornix-for-sdvx
 build:
   cmake: .
   kconfig: Kconfig
