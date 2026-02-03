@@ -4,9 +4,9 @@ compatible: "zmk,behavior-sensor-hold-rotate"
 
 properties:
   bindings:
-    type: phandles
+    type: phandle-array
     required: true
-    description: "Two bindings: CW binding then CCW binding."
+    description: "Two bindings: CW then CCW (each can have params, e.g. &kp C_VOL_UP)."
 
   timeout-ms:
     type: int
