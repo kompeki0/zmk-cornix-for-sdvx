@@ -252,12 +252,21 @@ static const struct behavior_driver_api api = {
                               (DT_INST_PHA_BY_IDX(node, prop, idx, param2))),                        \
     }
 
+#define _BINDING_ENTRY(idx, node)                                                                    \
+    {                                                                                                \
+        .behavior_dev = DEVICE_DT_NAME(DT_INST_PHANDLE_BY_IDX(node, bindings, idx)),                 \
+        .param1 = COND_CODE_0(DT_INST_PHA_HAS_CELL_AT_IDX(node, bindings, idx, param1), (0),         \
+                              (DT_INST_PHA_BY_IDX(node, bindings, idx, param1))),                    \
+        .param2 = COND_CODE_0(DT_INST_PHA_HAS_CELL_AT_IDX(node, bindings, idx, param2), (0),         \
+                              (DT_INST_PHA_BY_IDX(node, bindings, idx, param2))),                    \
+    }
+
 #define INST(n)                                                                                      \
     static const struct behavior_sensor_hold_step_rotate_config cfg_##n = {                          \
-        .hold_cw  = _TRANSFORM_ENTRY(hold_bindings, 0, n),                                            \
-        .hold_ccw = _TRANSFORM_ENTRY(hold_bindings, 1, n),                                            \
-        .step_cw  = _TRANSFORM_ENTRY(step_bindings, 0, n),                                            \
-        .step_ccw = _TRANSFORM_ENTRY(step_bindings, 1, n),                                            \
+        .hold_cw  = _BINDING_ENTRY(0, n),                                                             \
+        .hold_ccw = _BINDING_ENTRY(1, n),                                                             \
+        .step_cw  = _BINDING_ENTRY(2, n),                                                             \
+        .step_ccw = _BINDING_ENTRY(3, n),                                                             \
         .timeout_ms = DT_INST_PROP_OR(n, timeout_ms, 180),                                            \
         .step_group_size = DT_INST_PROP_OR(n, step_group_size, 5),                                   \
         .direction_hold_mode = DT_INST_PROP_OR(n, direction_hold_mode, 0),                            \
@@ -269,3 +278,4 @@ static const struct behavior_driver_api api = {
         &api);
 
 DT_INST_FOREACH_STATUS_OKAY(INST)
+
