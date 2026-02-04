@@ -1,0 +1,36 @@
+description: Sensor rotate with hold + grouped step actions
+
+compatible: "zmk,behavior-sensor-hold-step-rotate"
+
+properties:
+  "#sensor-binding-cells":
+    type: int
+    required: true
+    const: 0
+
+  timeout-ms:
+    type: int
+    required: false
+    default: 180
+
+  step-group-size:
+    type: int
+    required: false
+    default: 5
+    description: "Fire step-binding once per N detents."
+
+  direction-hold-mode:
+    type: int
+    required: false
+    default: 0
+    description: "0: SWITCH hold on direction, 1: STICKY keep holding even if direction reverses."
+
+  hold-bindings:
+    type: phandle-array
+    required: true
+    description: "Two bindings: hold for CW, hold for CCW (may be identical)."
+
+  step-bindings:
+    type: phandle-array
+    required: true
+    description: "Two bindings: step action for CW, step action for CCW."

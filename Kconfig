@@ -14,3 +14,7 @@ menuconfig ZMK_BEHAVIOR_SENSOR_HOLD_ROTATE
       - same direction steps only extend timeout
       - reverse direction releases previous and presses new
       - timeout releases
+
+menuconfig ZMK_BEHAVIOR_SENSOR_HOLD_STEP_ROTATE
+    bool "Sensor hold+step rotate behavior"
+    default y
