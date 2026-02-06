@@ -28,10 +28,10 @@ properties:
     required: true
     description: "Four bindings: hold_cw, hold_ccw, step_cw, step_ccw"
 
-  layers:
-    type: array
+  require-top-layer:
+    type: boolean
     required: false
-    description: "If set, behavior runs only on these layer numbers."
+    description: "If set, behavior runs only on top layer."
 
   quick-release:
     type: boolean
