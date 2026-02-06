@@ -36,6 +36,6 @@ properties:
   quick-release:
     type: boolean
 
-  quick-release-allowed-list:
+  quick-release-allow-list:
     type: array
     required: false

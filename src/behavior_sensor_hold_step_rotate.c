@@ -21,8 +21,6 @@
 #include <zmk/hid.h>
 #include <zmk/keys.h>
 
-#include <sys/slist.h>
-
 #ifndef ZMK_KEYMAP_SENSORS_LEN
 #define ZMK_KEYMAP_SENSORS_LEN 0
 #endif
@@ -32,20 +30,6 @@
 #endif
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
-
-/*
- * 目的:
- * - 回転中: hold-bindings を長押し（timeoutでrelease）
- * - 回転ステップをカウントし、step-group-sizeごとに step-bindings をtap発火
- * - direction-hold-mode:
- *   0=SWITCH: 逆回転でholdを切替（release→press）
- *   1=STICKY: 逆回転でもholdは維持（途切れない）
- *
- * 追加:
- * - layers: 指定レイヤーでのみ動作（未指定=全レイヤー）
- * - quick-release: “許可キー以外” が押された瞬間に hold を解除＆step_countリセット
- *   quick-release-allow-list = <TAB LALT ...>; のように keys.h のキーコード列挙で指定
- */
 
 enum hold_dir {
     HOLD_DIR_NONE = 0,
@@ -70,13 +54,11 @@ struct behavior_sensor_hold_step_rotate_config {
     struct zmk_behavior_binding step_ccw;
 
     uint16_t timeout_ms;
-    uint16_t step_group_size;     // N
-    uint8_t direction_hold_mode;  // 0/1
+    uint16_t step_group_size;
+    uint8_t direction_hold_mode;
 
-    // layers (0 = no restriction)
     uint32_t layers_mask;
 
-    // quick-release
     bool quick_release;
     uint8_t allow_count;
     struct allow_item allow_list[];
@@ -98,15 +80,13 @@ struct hold_state {
 struct behavior_sensor_hold_step_rotate_data {
     enum hold_dir pending_dir[ZMK_KEYMAP_SENSORS_LEN][ZMK_KEYMAP_LAYERS_LEN];
     struct hold_state state[ZMK_KEYMAP_SENSORS_LEN][ZMK_KEYMAP_LAYERS_LEN];
-
-    // instance list
-    sys_snode_t node;
-    const struct device *dev;
 };
 
-static sys_slist_t instances = SYS_SLIST_STATIC_INIT(&instances);
+/* ---- instance list (caps_word style) ---- */
+#define GET_DEV(inst) DEVICE_DT_INST_GET(inst),
+static const struct device *devs[] = {DT_INST_FOREACH_STATUS_OKAY(GET_DEV)};
 
-/* ---------- helpers ---------- */
+/* ---- helpers ---- */
 
 static inline bool layer_allowed_mask(uint32_t mask, uint8_t layer) {
     if (mask == 0u) return true;
@@ -148,6 +128,8 @@ static void arm_timeout(const struct behavior_sensor_hold_step_rotate_config *cf
 static void force_release_state(const struct behavior_sensor_hold_step_rotate_config *cfg,
                                 struct hold_state *st,
                                 bool cancel_timer) {
+    ARG_UNUSED(cfg);
+
     if (!st->active) {
         st->step_count = 0;
         if (cancel_timer) {
@@ -166,7 +148,6 @@ static void force_release_state(const struct behavior_sensor_hold_step_rotate_co
     ev.source = ZMK_POSITION_STATE_CHANGE_SOURCE_LOCAL;
 #endif
 
-    LOG_DBG("force release pos=%d layer=%d", ev.position, ev.layer);
     enqueue_release(&ev, st->active_binding);
     st->active = false;
     st->step_count = 0;
@@ -176,27 +157,12 @@ static void force_release_state(const struct behavior_sensor_hold_step_rotate_co
     }
 }
 
-static void reset_layer_state(const struct device *dev, int sensor_index, uint8_t layer) {
-    struct behavior_sensor_hold_step_rotate_data *data = dev->data;
-    data->pending_dir[sensor_index][layer] = HOLD_DIR_NONE;
-
-    // “そのレイヤーのholdを殺す” のが安全（上レイヤー誤発火対策）
-    struct hold_state *st = &data->state[sensor_index][layer];
-    if (st->inited) {
-        // cfg が必要なので呼び元で処理（ここでは蓄積だけリセット）
-        st->step_count = 0;
-    }
-}
-
 static bool is_allowed_key(const struct behavior_sensor_hold_step_rotate_config *cfg,
                            uint16_t usage_page, uint16_t usage_id) {
     if (cfg->allow_count == 0) {
-        // allow-list 未指定なら「何でも許可」とはせず、
-        // quick-release ON でも事故りにくいよう “許可ゼロ=全部禁止” にしておくのが安全。
-        // ただし使い勝手が悪ければここは true に変えてOK。
+        // allow-list未指定なら「許可なし」扱い（安全側）
         return false;
     }
-
     for (int i = 0; i < cfg->allow_count; i++) {
         if (cfg->allow_list[i].page == usage_page && cfg->allow_list[i].id == usage_id) {
             return true;
@@ -205,7 +171,7 @@ static bool is_allowed_key(const struct behavior_sensor_hold_step_rotate_config 
     return false;
 }
 
-/* ---------- timeout handler ---------- */
+/* ---- timeout handler ---- */
 
 static void release_work_handler(struct k_work *work) {
     struct k_work_delayable *dwork = k_work_delayable_from_work(work);
@@ -225,64 +191,45 @@ static void release_work_handler(struct k_work *work) {
     ev.source = ZMK_POSITION_STATE_CHANGE_SOURCE_LOCAL;
 #endif
 
-    LOG_DBG("timeout release pos=%d layer=%d", ev.position, ev.layer);
     enqueue_release(&ev, st->active_binding);
     st->active = false;
-
-    // “操作セッション”終了扱い
     st->step_count = 0;
 }
 
-/* ---------- quick-release listener ----------
- * “許可キー以外が押された瞬間”に hold を解除
- */
+/* ---- quick-release listener ---- */
+
 static int hold_step_quick_release_listener(const zmk_event_t *eh) {
     const struct zmk_keycode_state_changed *ev = as_zmk_keycode_state_changed(eh);
-    if (!ev) {
+    if (ev == NULL || !ev->state) {
         return ZMK_EV_EVENT_BUBBLE;
     }
 
-    // 押下の瞬間だけ
-    if (!ev->state) {
-        return ZMK_EV_EVENT_BUBBLE;
-    }
-
-    // modifiers 単体は基本スルー（これを quick-release トリガにすると誤爆しがち）
+    // modifier単体は誤爆しやすいので基本スルー
     if (is_mod(ev->usage_page, ev->keycode)) {
         return ZMK_EV_EVENT_BUBBLE;
     }
 
-    sys_snode_t *n;
-    SYS_SLIST_FOR_EACH_NODE(&instances, n) {
-        struct behavior_sensor_hold_step_rotate_data *idata =
-            CONTAINER_OF(n, struct behavior_sensor_hold_step_rotate_data, node);
-
-        const struct device *dev = idata->dev;
+    for (int di = 0; di < ARRAY_SIZE(devs); di++) {
+        const struct device *dev = devs[di];
         const struct behavior_sensor_hold_step_rotate_config *cfg = dev->config;
+        struct behavior_sensor_hold_step_rotate_data *data = dev->data;
 
-        if (!cfg->quick_release) {
-            continue;
-        }
+        if (!cfg->quick_release) continue;
 
-        // 許可キーなら何もしない
-        if (is_allowed_key(cfg, ev->usage_page, ev->keycode)) {
-            continue;
-        }
+        // 許可キーなら継続
+        if (is_allowed_key(cfg, ev->usage_page, ev->keycode)) continue;
 
-        // 許可外キーが押された → 全sensor×許可レイヤーの active hold を解除
+        // 許可外キーが押された → 許可レイヤーの active hold を解除
         for (int si = 0; si < ZMK_KEYMAP_SENSORS_LEN; si++) {
             for (int ly = 0; ly < ZMK_KEYMAP_LAYERS_LEN; ly++) {
-                if (!layer_allowed(cfg, (uint8_t)ly)) {
-                    continue;
-                }
-                struct hold_state *st = &idata->state[si][ly];
+                if (!layer_allowed(cfg, (uint8_t)ly)) continue;
+                struct hold_state *st = &data->state[si][ly];
                 if (st->active) {
-                    LOG_DBG("quick-release by key: page=0x%02X id=0x%02X", ev->usage_page, ev->keycode);
                     force_release_state(cfg, st, true);
                 } else {
-                    // step_countだけ溜まってるケースも潰す
                     st->step_count = 0;
                 }
+                data->pending_dir[si][ly] = HOLD_DIR_NONE;
             }
         }
     }
@@ -293,7 +240,7 @@ static int hold_step_quick_release_listener(const zmk_event_t *eh) {
 ZMK_LISTENER(behavior_sensor_hold_step_rotate_quick_release, hold_step_quick_release_listener);
 ZMK_SUBSCRIPTION(behavior_sensor_hold_step_rotate_quick_release, zmk_keycode_state_changed);
 
-/* ---------- sensor binding impl ---------- */
+/* ---- behavior implementation ---- */
 
 static int accept_data(struct zmk_behavior_binding *binding,
                        struct zmk_behavior_binding_event event,
@@ -310,15 +257,13 @@ static int accept_data(struct zmk_behavior_binding *binding,
 
     const int sensor_index = ZMK_SENSOR_POSITION_FROM_VIRTUAL_KEY_POSITION(event.position);
 
-    // ★ layers 制限：許可以外は pending を残さない
     if (!layer_allowed(cfg, (uint8_t)event.layer)) {
-        reset_layer_state(dev, sensor_index, (uint8_t)event.layer);
+        data->pending_dir[sensor_index][event.layer] = HOLD_DIR_NONE;
+        data->state[sensor_index][event.layer].step_count = 0;
         return 0;
     }
 
     const struct sensor_value v = channel_data[0].value;
-
-    // val1==0ならval2をtickとみなす
     int delta = (v.val1 == 0) ? v.val2 : v.val1;
 
     if (delta > 0) {
@@ -328,10 +273,6 @@ static int accept_data(struct zmk_behavior_binding *binding,
     } else {
         data->pending_dir[sensor_index][event.layer] = HOLD_DIR_NONE;
     }
-
-    LOG_DBG("accept pos=%d layer=%d val1=%d val2=%d delta=%d dir=%d",
-            event.position, event.layer, v.val1, v.val2, delta,
-            data->pending_dir[sensor_index][event.layer]);
 
     return 0;
 }
@@ -344,10 +285,9 @@ static int process(struct zmk_behavior_binding *binding,
     struct behavior_sensor_hold_step_rotate_data *data = dev->data;
 
     const int sensor_index = ZMK_SENSOR_POSITION_FROM_VIRTUAL_KEY_POSITION(event.position);
+    struct hold_state *st = &data->state[sensor_index][event.layer];
 
-    // ★ layers 制限：許可以外は握りつぶし＆安全に“そのレイヤーのhold”を解除
     if (!layer_allowed(cfg, (uint8_t)event.layer)) {
-        struct hold_state *st = &data->state[sensor_index][event.layer];
         if (st->active) {
             force_release_state(cfg, st, true);
         } else if (st->inited) {
@@ -379,32 +319,25 @@ static int process(struct zmk_behavior_binding *binding,
     struct zmk_behavior_binding step_binding =
         (dir == HOLD_DIR_CW) ? cfg->step_cw : cfg->step_ccw;
 
-    struct hold_state *st = &data->state[sensor_index][event.layer];
-
     if (!st->inited) {
         k_work_init_delayable(&st->release_work, release_work_handler);
         st->inited = true;
     }
 
-    // timeout release 用の情報を更新
     st->last_position = event.position;
     st->last_layer = (uint8_t)event.layer;
 
-    // ---- step group: N回ごとにtap ----
+    // step
     uint16_t n = cfg->step_group_size ? cfg->step_group_size : 1;
     st->step_count++;
-
     if ((st->step_count % n) == 0) {
-        LOG_DBG("step fire count=%d n=%d", st->step_count, n);
         enqueue_tap(&event, step_binding);
     }
 
-    // ---- hold ----
+    // hold
     if (!st->active) {
         st->active = true;
         st->active_binding = hold_next;
-
-        LOG_DBG("hold press start dir=%s", (dir == HOLD_DIR_CW) ? "cw" : "ccw");
         enqueue_press(&event, st->active_binding);
         arm_timeout(cfg, st);
         return ZMK_BEHAVIOR_OPAQUE;
@@ -412,15 +345,10 @@ static int process(struct zmk_behavior_binding *binding,
 
     if (cfg->direction_hold_mode == HOLD_MODE_SWITCH) {
         if (!binding_equal(st->active_binding, hold_next)) {
-            LOG_DBG("hold switch");
             enqueue_release(&event, st->active_binding);
             st->active_binding = hold_next;
             enqueue_press(&event, st->active_binding);
-        } else {
-            LOG_DBG("hold extend");
         }
-    } else {
-        LOG_DBG("hold sticky extend");
     }
 
     arm_timeout(cfg, st);
@@ -433,21 +361,18 @@ static const struct behavior_driver_api api = {
 };
 
 static int init(const struct device *dev) {
-    struct behavior_sensor_hold_step_rotate_data *data = dev->data;
-    data->dev = dev;
-    sys_slist_append(&instances, &data->node);
+    // dataに何か入れる必要があるならここで
     return 0;
 }
 
-/* ---- layers mask (DT layers array -> uint32) ---- */
+/* ---- layers mask ---- */
 #define _LAYER_BIT(node_id, prop, idx) (| (1u << DT_PROP_BY_IDX(node_id, prop, idx)))
-
 #define LAYER_MASK_FROM_INST(n)                                                                     \
     COND_CODE_0(DT_INST_NODE_HAS_PROP(n, layers),                                                    \
                 (0u),                                                                               \
                 (0u DT_FOREACH_PROP_ELEM_SEP(DT_DRV_INST(n), layers, _LAYER_BIT, ())))
 
-/* ---- allow-list parse (DT keycode array -> allow_item[]) ---- */
+/* ---- allow-list parse ---- */
 #define _ALLOW_ITEM(node_id, prop, idx)                                                             \
     {                                                                                                \
         .page = (uint16_t)ZMK_HID_USAGE_PAGE(DT_PROP_BY_IDX(node_id, prop, idx)),                    \
