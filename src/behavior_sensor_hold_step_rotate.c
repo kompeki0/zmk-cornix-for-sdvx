@@ -366,11 +366,12 @@ static int init(const struct device *dev) {
 }
 
 /* ---- layers mask ---- */
-#define _LAYER_BIT(node_id, prop, idx) (| (1u << DT_PROP_BY_IDX(node_id, prop, idx)))
+#define _LAYER_BIT(node_id, prop, idx) (1u << DT_PROP_BY_IDX(node_id, prop, idx))
+
 #define LAYER_MASK_FROM_INST(n)                                                                     \
     COND_CODE_0(DT_INST_NODE_HAS_PROP(n, layers),                                                    \
                 (0u),                                                                               \
-                (0u DT_FOREACH_PROP_ELEM_SEP(DT_DRV_INST(n), layers, _LAYER_BIT, ())))
+                (DT_FOREACH_PROP_ELEM_SEP(DT_DRV_INST(n), layers, _LAYER_BIT, (|)) | 0u))
 
 /* ---- allow-list parse ---- */
 #define _ALLOW_ITEM(node_id, prop, idx)                                                             \
