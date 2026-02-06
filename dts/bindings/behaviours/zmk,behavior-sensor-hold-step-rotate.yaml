@@ -27,3 +27,15 @@ properties:
     type: phandle-array
     required: true
     description: "Four bindings: hold_cw, hold_ccw, step_cw, step_ccw"
+
+  layers:
+    type: array
+    required: false
+    description: "If set, behavior runs only on these layer numbers."
+
+  quick-release:
+    type: boolean
+
+  quick-release-allowed-list:
+    type: array
+    required: false
