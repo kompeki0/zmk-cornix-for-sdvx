@@ -168,7 +168,7 @@ static bool is_allowed_key(const struct behavior_sensor_hold_step_rotate_config 
             return true;
         }
     }
-    return false
+    return false;
 }
 
 /* ---- timeout handler ---- */
