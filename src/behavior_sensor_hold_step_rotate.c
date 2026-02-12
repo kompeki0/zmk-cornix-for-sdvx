@@ -20,7 +20,7 @@
 
 #include <zmk/hid.h>
 #include <zmk/keys.h>
-#include <zmk/keymap.h>   // ★追加：トップレイヤー取得
+#include <zmk/keymap.h>
 
 #ifndef ZMK_KEYMAP_SENSORS_LEN
 #define ZMK_KEYMAP_SENSORS_LEN 0
@@ -55,11 +55,13 @@ struct behavior_sensor_hold_step_rotate_config {
     struct zmk_behavior_binding step_ccw;
 
     uint16_t timeout_ms;
-    uint16_t step_group_size;
+    uint16_t step_group_size;     // 0 => step disabled
     uint8_t direction_hold_mode;
 
-    // ★追加：トップレイヤー限定（trueならトップ以外では絶対発動しない）
     bool require_top_layer;
+
+    // ★追加：逆方向チャタリング抑制（ms）。0なら無効。
+    uint16_t anti_reverse_ms;
 
     // quick-release
     bool quick_release;
@@ -76,6 +78,10 @@ struct hold_state {
     uint8_t last_layer;
 
     uint16_t step_count;
+
+    // ★追加：方向履歴（チャタリング抑制用）
+    enum hold_dir last_dir;
+    int64_t last_dir_time_ms;
 
     struct k_work_delayable release_work;
 };
@@ -99,18 +105,31 @@ static inline bool gate_layer(const struct behavior_sensor_hold_step_rotate_conf
     return (!cfg->require_top_layer) || is_top_layer(layer);
 }
 
+static inline bool binding_is_valid(const struct zmk_behavior_binding b) {
+    return b.behavior_dev && b.behavior_dev[0] != '\0';
+}
+
 static int enqueue_press(struct zmk_behavior_binding_event *event,
                          struct zmk_behavior_binding binding) {
+    if (!binding_is_valid(binding)) {
+        return ZMK_BEHAVIOR_OPAQUE;
+    }
     return zmk_behavior_queue_add(event, binding, true, 0);
 }
 
 static int enqueue_release(struct zmk_behavior_binding_event *event,
                            struct zmk_behavior_binding binding) {
+    if (!binding_is_valid(binding)) {
+        return ZMK_BEHAVIOR_OPAQUE;
+    }
     return zmk_behavior_queue_add(event, binding, false, 0);
 }
 
 static int enqueue_tap(struct zmk_behavior_binding_event *event,
                        struct zmk_behavior_binding binding) {
+    if (!binding_is_valid(binding)) {
+        return ZMK_BEHAVIOR_OPAQUE;
+    }
     zmk_behavior_queue_add(event, binding, true, 0);
     return zmk_behavior_queue_add(event, binding, false, 0);
 }
@@ -196,7 +215,12 @@ static void release_work_handler(struct k_work *work) {
     st->step_count = 0;
 }
 
-/* ---- quick-release listener ---- */
+/* ---- quick-release listener ----
+ * 安全化ポイント:
+ * - pending_dir は絶対に触らない（accept→process間の競合を避ける）
+ * - 未使用インスタンス/未初期化 state は触らない（「存在するだけで副作用」を防ぐ）
+ * - active のものだけ解除する（step_count等の副作用を最小に）
+ */
 
 static int hold_step_quick_release_listener(const zmk_event_t *eh) {
     const struct zmk_keycode_state_changed *ev = as_zmk_keycode_state_changed(eh);
@@ -216,26 +240,26 @@ static int hold_step_quick_release_listener(const zmk_event_t *eh) {
         struct behavior_sensor_hold_step_rotate_data *data = dev->data;
 
         if (!cfg->quick_release) continue;
-
         if (is_allowed_key(cfg, ev->usage_page, ev->keycode)) continue;
 
         for (int si = 0; si < ZMK_KEYMAP_SENSORS_LEN; si++) {
             for (int ly = 0; ly < ZMK_KEYMAP_LAYERS_LEN; ly++) {
-                data->pending_dir[si][ly] = HOLD_DIR_NONE;
-
                 struct hold_state *st = &data->state[si][ly];
 
-                // ★トップレイヤー限定なら「トップ以外で動いてたhold」は安全のため解除
+                // 未初期化は触らない（未使用インスタンス無害化）
+                if (!st->inited) {
+                    continue;
+                }
+
+                // トップレイヤー限定で、非トップで動いていた hold は解除
                 if (cfg->require_top_layer && st->active && st->last_layer != top) {
                     force_release_state(cfg, st, true);
                     continue;
                 }
 
-                // 通常のquick-release（許可外キー押下で解除）
+                // 許可外キー押下で解除：activeだけ対象にする
                 if (st->active) {
                     force_release_state(cfg, st, true);
-                } else {
-                    st->step_count = 0;
                 }
             }
         }
@@ -264,10 +288,10 @@ static int accept_data(struct zmk_behavior_binding *binding,
 
     const int sensor_index = ZMK_SENSOR_POSITION_FROM_VIRTUAL_KEY_POSITION(event.position);
 
-    // ★トップレイヤー以外なら絶対に状態を残さない
+    // ★トップレイヤー以外なら状態を残さない
     if (!gate_layer(cfg, (uint8_t)event.layer)) {
         data->pending_dir[sensor_index][event.layer] = HOLD_DIR_NONE;
-        data->state[sensor_index][event.layer].step_count = 0;
+        // step_countはprocess側でactiveなら解除するので、ここでは触りすぎない
         return 0;
     }
 
@@ -295,15 +319,15 @@ static int process(struct zmk_behavior_binding *binding,
     const int sensor_index = ZMK_SENSOR_POSITION_FROM_VIRTUAL_KEY_POSITION(event.position);
     struct hold_state *st = &data->state[sensor_index][event.layer];
 
-    // ★トップレイヤー以外なら絶対発動しない（必要なら安全解除）
+    // トップレイヤー以外なら発動しない（activeなら安全解除）
     if (!gate_layer(cfg, (uint8_t)event.layer)) {
         data->pending_dir[sensor_index][event.layer] = HOLD_DIR_NONE;
-        if (st->active) {
+
+        if (st->inited && st->active) {
             force_release_state(cfg, st, true);
-        } else if (st->inited) {
-            st->step_count = 0;
         }
-        return ZMK_BEHAVIOR_OPAQUE;
+        // ここで OPAQUE にすると他behaviorを殺し得るので TRANSPARENT
+        return ZMK_BEHAVIOR_TRANSPARENT;
     }
 
     if (mode != BEHAVIOR_SENSOR_BINDING_PROCESS_MODE_TRIGGER) {
@@ -322,38 +346,55 @@ static int process(struct zmk_behavior_binding *binding,
     event.source = ZMK_POSITION_STATE_CHANGE_SOURCE_LOCAL;
 #endif
 
+    // init state（早めに）
+    int64_t now_ms = k_uptime_get();
+    if (!st->inited) {
+        k_work_init_delayable(&st->release_work, release_work_handler);
+        st->inited = true;
+        st->active = false;
+        st->step_count = 0;
+        st->last_dir = HOLD_DIR_NONE;
+        st->last_dir_time_ms = now_ms;
+    }
+
+    // ---- anti reverse chatter ----
+    if (cfg->anti_reverse_ms > 0 && st->last_dir != HOLD_DIR_NONE) {
+        bool is_reverse = (st->last_dir == HOLD_DIR_CW && dir == HOLD_DIR_CCW) ||
+                          (st->last_dir == HOLD_DIR_CCW && dir == HOLD_DIR_CW);
+
+        if (is_reverse && (now_ms - st->last_dir_time_ms) <= cfg->anti_reverse_ms) {
+            // 逆向きの短時間入力は無視して直近方向へ丸める
+            dir = st->last_dir;
+        }
+    }
+    st->last_dir = dir;
+    st->last_dir_time_ms = now_ms;
+
     struct zmk_behavior_binding hold_next =
         (dir == HOLD_DIR_CW) ? cfg->hold_cw : cfg->hold_ccw;
 
     struct zmk_behavior_binding step_binding =
         (dir == HOLD_DIR_CW) ? cfg->step_cw : cfg->step_ccw;
 
-    if (!st->inited) {
-        k_work_init_delayable(&st->release_work, release_work_handler);
-        st->inited = true;
-    }
-
     st->last_position = event.position;
     st->last_layer = (uint8_t)event.layer;
 
     // ---- step (optional) ----
-    // step_group_size == 0 ならステップ機能を無効化
-    if (cfg->step_group_size == 0) {
-        // 「ホールドだけ」モードでも、セッション単位のカウントが不要ならリセットしておく
-        st->step_count = 0;
-    } else {
-        const uint16_t n = cfg->step_group_size; // 1以上が保証される
+    if (cfg->step_group_size != 0) {
+        const uint16_t n = cfg->step_group_size;
         st->step_count++;
 
-        // step_binding が &none のような無効値でも事故らないよう保険
-        if (step_binding.behavior_dev && step_binding.behavior_dev[0] != '\0') {
+        if (binding_is_valid(step_binding)) {
             if ((st->step_count % n) == 0) {
                 enqueue_tap(&event, step_binding);
             }
         }
+    } else {
+        // step無効ならカウントも持たない（副作用抑制）
+        st->step_count = 0;
     }
 
-    // hold
+    // ---- hold ----
     if (!st->active) {
         st->active = true;
         st->active_binding = hold_next;
@@ -395,40 +436,41 @@ static int init(const struct device *dev) {
                               (DT_INST_PHA_BY_IDX(inst, bindings, idx, param2))),                   \
     }
 
-#define _ALLOW_ITEM(i, inst)                                                                         \
-    {                                                                                                \
-        .page = (uint16_t)ZMK_HID_USAGE_PAGE(DT_INST_PROP_BY_IDX(inst, quick_release_allow_list, i)),\
-        .id   = (uint16_t)ZMK_HID_USAGE_ID(DT_INST_PROP_BY_IDX(inst, quick_release_allow_list, i)),  \
+#define _ALLOW_ITEM(i, inst)                                                                          \
+    {                                                                                                 \
+        .page = (uint16_t)ZMK_HID_USAGE_PAGE(DT_INST_PROP_BY_IDX(inst, quick_release_allow_list, i)), \
+        .id   = (uint16_t)ZMK_HID_USAGE_ID(DT_INST_PROP_BY_IDX(inst, quick_release_allow_list, i)),   \
     }
 
-#define ALLOW_COUNT_FROM_INST(inst)                                                                  \
-    COND_CODE_0(DT_INST_NODE_HAS_PROP(inst, quick_release_allow_list),                                \
-                (0),                                                                                 \
+#define ALLOW_COUNT_FROM_INST(inst)                                                                   \
+    COND_CODE_0(DT_INST_NODE_HAS_PROP(inst, quick_release_allow_list),                                 \
+                (0),                                                                                  \
                 (DT_INST_PROP_LEN(inst, quick_release_allow_list)))
 
-#define ALLOW_LIST_FROM_INST(inst)                                                                   \
-    COND_CODE_0(DT_INST_NODE_HAS_PROP(inst, quick_release_allow_list),                                \
-                (),                                                                                  \
+#define ALLOW_LIST_FROM_INST(inst)                                                                    \
+    COND_CODE_0(DT_INST_NODE_HAS_PROP(inst, quick_release_allow_list),                                 \
+                (),                                                                                   \
                 (LISTIFY(DT_INST_PROP_LEN(inst, quick_release_allow_list), _ALLOW_ITEM, (,), inst)))
 
-#define INST(n)                                                                                      \
-    static struct behavior_sensor_hold_step_rotate_data data_##n = {};                               \
-    static const struct behavior_sensor_hold_step_rotate_config cfg_##n = {                          \
-        .hold_cw  = _BINDING_ENTRY(0, n),                                                             \
-        .hold_ccw = _BINDING_ENTRY(1, n),                                                             \
-        .step_cw  = _BINDING_ENTRY(2, n),                                                             \
-        .step_ccw = _BINDING_ENTRY(3, n),                                                             \
-        .timeout_ms = DT_INST_PROP_OR(n, timeout_ms, 180),                                            \
-        .step_group_size = DT_INST_PROP_OR(n, step_group_size, 5),                                   \
-        .direction_hold_mode = DT_INST_PROP_OR(n, direction_hold_mode, 0),                            \
-        .require_top_layer = DT_INST_PROP_OR(n, require_top_layer, 1),                                \
-        .quick_release = DT_INST_PROP_OR(n, quick_release, 0),                                        \
-        .allow_count = (uint8_t)ALLOW_COUNT_FROM_INST(n),                                             \
-        .allow_list = { ALLOW_LIST_FROM_INST(n) },                                                    \
-    };                                                                                               \
-    BEHAVIOR_DT_INST_DEFINE(                                                                          \
-        n, init, NULL, &data_##n, &cfg_##n,                                                           \
-        POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT,                                             \
+#define INST(n)                                                                                       \
+    static struct behavior_sensor_hold_step_rotate_data data_##n = {};                                \
+    static const struct behavior_sensor_hold_step_rotate_config cfg_##n = {                           \
+        .hold_cw  = _BINDING_ENTRY(0, n),                                                              \
+        .hold_ccw = _BINDING_ENTRY(1, n),                                                              \
+        .step_cw  = _BINDING_ENTRY(2, n),                                                              \
+        .step_ccw = _BINDING_ENTRY(3, n),                                                              \
+        .timeout_ms = DT_INST_PROP_OR(n, timeout_ms, 180),                                             \
+        .step_group_size = DT_INST_PROP_OR(n, step_group_size, 5),                                     \
+        .direction_hold_mode = DT_INST_PROP_OR(n, direction_hold_mode, 0),                             \
+        .require_top_layer = DT_INST_PROP_OR(n, require_top_layer, 1),                                 \
+        .anti_reverse_ms = DT_INST_PROP_OR(n, anti_reverse_ms, 0),                                     \
+        .quick_release = DT_INST_PROP_OR(n, quick_release, 0),                                         \
+        .allow_count = (uint8_t)ALLOW_COUNT_FROM_INST(n),                                              \
+        .allow_list = { ALLOW_LIST_FROM_INST(n) },                                                     \
+    };                                                                                                \
+    BEHAVIOR_DT_INST_DEFINE(                                                                           \
+        n, init, NULL, &data_##n, &cfg_##n,                                                            \
+        POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT,                                              \
         &api);
 
 DT_INST_FOREACH_STATUS_OKAY(INST)

@@ -40,3 +40,8 @@ properties:
   quick-release-allow-list:
     type: array
     required: false
+
+  anti-reverse-ms:
+    type: int
+    required: false
+    default: 20
