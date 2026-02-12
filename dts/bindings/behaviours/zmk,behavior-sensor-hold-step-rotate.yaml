@@ -17,6 +17,7 @@ properties:
     type: int
     required: false
     default: 5
+    description: "Fire step binding once per N detents. 0 disables step taps."
 
   direction-hold-mode:
     type: int

@@ -168,7 +168,7 @@ static bool is_allowed_key(const struct behavior_sensor_hold_step_rotate_config 
             return true;
         }
     }
-    return false;
+    return false
 }
 
 /* ---- timeout handler ---- */
@@ -336,11 +336,21 @@ static int process(struct zmk_behavior_binding *binding,
     st->last_position = event.position;
     st->last_layer = (uint8_t)event.layer;
 
-    // step
-    uint16_t n = cfg->step_group_size ? cfg->step_group_size : 1;
-    st->step_count++;
-    if ((st->step_count % n) == 0) {
-        enqueue_tap(&event, step_binding);
+    // ---- step (optional) ----
+    // step_group_size == 0 ならステップ機能を無効化
+    if (cfg->step_group_size == 0) {
+        // 「ホールドだけ」モードでも、セッション単位のカウントが不要ならリセットしておく
+        st->step_count = 0;
+    } else {
+        const uint16_t n = cfg->step_group_size; // 1以上が保証される
+        st->step_count++;
+
+        // step_binding が &none のような無効値でも事故らないよう保険
+        if (step_binding.behavior_dev && step_binding.behavior_dev[0] != '\0') {
+            if ((st->step_count % n) == 0) {
+                enqueue_tap(&event, step_binding);
+            }
+        }
     }
 
     // hold
